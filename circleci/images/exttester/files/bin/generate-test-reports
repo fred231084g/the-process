@@ -1,0 +1,297 @@
+#!/usr/bin/env perl -w
+
+use strict;
+
+use feature "switch";
+no warnings 'experimental::smartmatch';
+
+use File::Basename;
+use Sys::Hostname;
+use XML::Writer;
+
+sub parse_timings_file {
+    my ($suite_name) = @_;
+    my %timings = ();
+
+    open( my $timing_fh, '<', "$suite_name/timing.txt" ) or die $!;
+    while ( my $line = <$timing_fh> ) {
+        chomp $line;
+        my ( $case_name, $duration ) = ( split( / /, $line ) );
+        $timings{$case_name} = $duration;
+    }
+    close($timing_fh);
+
+    return \%timings;
+}
+
+sub parse_results_patch {
+    my ($suite_name) = @_;
+    my %diffs = ();
+
+    if ( !-e "$suite_name/results.patch" ) {
+        return \%diffs;
+    }
+
+    local $/ =
+"\n======================================================================\n\n";
+    open my $patch_fh, "<", "$suite_name/results.patch" or die $!;
+
+    while ( my $diff = <$patch_fh> ) {
+        chomp $diff;
+        my @lines    = split( /\n/, $diff, -1 );
+        my $exp_line = shift @lines;
+        my $act_line = shift @lines;
+
+        my ( $exp_file, $case_name ) =
+          ( $exp_line =~ m/^--- (.*\/([^\/]+)\.out)\t.*$/ );
+        my ($act_file) = ( $act_line =~ m/^\+\+\+ (.*\/([^\/]+)\.out)\t.*$/ );
+
+        $exp_file = basename($exp_file);
+        $act_file = basename($act_file);
+
+        my $detail   = '';
+        my $exp_msg  = '';
+        my $act_msg  = '';
+        my $diff_msg = '';
+
+        foreach my $diff_line (@lines) {
+            if ( $diff_line =~ /^\@\@ -(\d+),(\d+) \+(\d+),(\d+) \@\@$/ ) {
+                $exp_msg =
+                  "expected (at $exp_file:$1-" . ( $1 + $2 - 1 ) . "):\n";
+                $act_msg =
+                  "     got (at $act_file:$3-" . ( $3 + $4 - 1 ) . "):\n";
+                $diff_msg = "    diff:\n";
+            }
+            elsif ( $diff_line =~ /^([ \-\+])(.*)$/ ) {
+                $diff_msg .= "\t$diff_line\n";
+
+                my $orig_line = "\t$2\n";
+                $exp_msg .= $orig_line if ( $1 eq ' ' or $1 eq '-' );
+                $act_msg .= $orig_line if ( $1 eq ' ' or $1 eq '+' );
+            }
+            elsif ( $diff_line eq '' ) {
+                $detail .= "$exp_msg\n$act_msg\n$diff_msg\n";
+                $exp_msg = $act_msg = $diff_msg = '';
+            }
+            else {
+                die 'unrecognized diff syntax';
+            }
+        }
+
+        $diffs{$case_name} = $detail;
+    }
+
+    return \%diffs;
+}
+
+sub parse_suite_streams {
+    my ($suite_name) = @_;
+    my $tests        = 0;
+    my $skipped      = 0;
+    my $failures     = 0;
+    my $errors       = 0;
+
+    my $timestamp = '';
+    my $duration  = '';
+
+    my %suite = (
+        name      => $suite_name,
+        tests     => 0,
+        skipped   => 0,
+        failures  => 0,
+        errors    => 0,
+        cases     => [],
+        timestamp => '',
+        duration  => '',
+        stdout    => '',
+        stderr    => ''
+    );
+
+    open( my $suite_out, '<', "$suite_name/out.txt" ) or die $!;
+    while ( my $line = <$suite_out> ) {
+        $suite{stdout} .= $line;
+        chomp $line;
+
+        if ( $line =~ /^began (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})$/ ) {
+            $suite{timestamp} = $1;
+        }
+        elsif ( $line =~ /elapsed ([0-9.]+)/ ) {
+            $suite{duration} = $1;
+        }
+        elsif ( $line =~ /^(?:test|    ) ([^ ]+)\s*... (.*)$/ ) {
+            my $case_name = $1;
+            my ( $status, $msg ) =
+              ( $2 =~ m/^(ok|FAILED|failed \(ignored\))(?: (.*))?$/ );
+
+            my %case = (
+                name   => $case_name,
+                status => 'unknown'
+            );
+
+            if ( defined($msg) ) {
+                $case{status}    = 'error';
+                $case{error_msg} = $msg;
+                $suite{errors}++;
+            }
+            elsif ( $status =~ /^ok/ ) {
+                $case{status} = 'success';
+            }
+            elsif ( $status =~ /^FAILED/ ) {
+                $case{status} = 'failure';
+                $suite{failures}++;
+            }
+            elsif ( $status =~ /^failed \(ignored\)/ ) {
+                $case{status} = 'ignored';
+                $suite{skipped}++;
+            }
+            else {
+                die 'unrecognized status';
+            }
+
+            push( $suite{cases}, \%case );
+            $suite{tests}++;
+        }
+    }
+    close($suite_out);
+
+    open( my $suite_err, '<', "$suite_name/err.txt" ) or die $!;
+    read $suite_err, $suite{stderr}, -s $suite_err;
+
+    return \%suite;
+}
+
+sub generate_suite_report {
+    my ($suite_name) = @_;
+    my $suite        = parse_suite_streams($suite_name);
+    my $timings      = parse_timings_file($suite_name);
+    my $failure_msgs = parse_results_patch($suite_name);
+    my $report_file  = IO::File->new(">TEST-$suite_name.xml");
+
+    my $xml_writer = XML::Writer->new(
+        OUTPUT      => $report_file,
+        DATA_MODE   => 1,
+        DATA_INDENT => 1,
+        ENCODING    => 'utf-8'
+    );
+
+    $xml_writer->xmlDecl();
+    $xml_writer->comment(
+        "Based on a sample JUnit report from https://llg.cubic.org/docs/junit/"
+    );
+
+    $xml_writer->startTag(
+        'testsuite',
+        'name'      => $suite->{name},
+        'tests'     => $suite->{tests},
+        'skipped'   => $suite->{skipped},
+        'errors'    => $suite->{errors},
+        'failures'  => $suite->{failures},
+        'hostname'  => hostname,
+        'time'      => $suite->{duration},
+        'timestamp' => $suite->{timestamp}
+    );
+    {
+        $xml_writer->startTag('properties');
+        {
+            open( PROPS, '<', "$suite_name/properties.txt" ) or die $!;
+            while ( my $line = <PROPS> ) {
+                chomp $line;
+                my ( $pname, $pvalue ) = split( /\t/, $line, 2 );
+
+                $xml_writer->emptyTag(
+                    'property',
+                    'name'  => $pname,
+                    'value' => $pvalue
+                );
+            }
+
+            close(PROPS);
+        }
+
+        $xml_writer->endTag('properties');
+
+        foreach my $case ( @{ $suite->{cases} } ) {
+            my $time = $timings->{ $case->{name} };
+            my %attrs = ( name => $case->{name} );
+
+            if ( exists $timings->{ $case->{name} } ) {
+                $attrs{time} = $timings->{ $case->{name} };
+            }
+
+            # TODO: add assertions
+            $xml_writer->startTag( 'testcase', %attrs );
+
+            given ( $case->{status} ) {
+                when ('success') {
+
+                    # nothing to do
+                }
+                when ('failure') {
+                    my $detail = $failure_msgs->{ $case->{name} };
+                    $xml_writer->cdataElement(
+                        'failure', $detail,
+                        'message' =>
+                          'SQL results differed from what was expected',
+                        'type' => 'results_differ'
+                    );
+                }
+                when ('error') {
+                    my $detail = $failure_msgs->{ $case->{name} };
+
+                    # TODO: replace failure detail with backtrace from crash
+                    $xml_writer->cdataElement(
+                        'error', $detail,
+                        'message' => $case->{error_msg},
+                        'type'    => 'child_failure'
+                    );
+                }
+                when ('ignored') {
+                    $xml_writer->emptyTag('skipped');
+                }
+                default {
+                    die 'unexpected test case status!';
+                }
+            }
+
+            $xml_writer->endTag('testcase');
+        }
+    }
+
+    $xml_writer->cdataElement( 'system-out', $suite->{stdout} );
+    $xml_writer->cdataElement( 'system-err', $suite->{stderr} );
+
+    $xml_writer->endTag('testsuite');
+
+    $xml_writer->end();
+    $report_file->close();
+}
+
+sub generate_all_reports {
+    my ($test_output_dir) = @_;
+
+    chdir($test_output_dir);
+    opendir my $dir, '.' or die "Cannot open directory: $!";
+
+    my @files = readdir $dir;
+    foreach my $file (@files) {
+        if ( $file ne '.' and $file ne '..' and -d $file ) {
+            generate_suite_report($file);
+        }
+    }
+    closedir $dir;
+}
+
+if ( ( $#ARGV + 1 ) != 1 ) {
+    die 'usage: junit-formatter.pl regress_output_dir';
+}
+
+my $test_output_dir = $ARGV[0];
+
+if ( !-e $test_output_dir ) {
+    die "specified file does not exist: $!";
+}
+elsif ( !-d $test_output_dir ) {
+    die "specified file is not a directory: $!";
+}
+
+generate_all_reports($test_output_dir);

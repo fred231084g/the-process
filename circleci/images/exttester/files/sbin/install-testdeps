@@ -21,7 +21,9 @@ apt-get install -y --no-install-recommends \
   ca-certificates \
   curl \
   debian-archive-keyring \
-  gcc
+  gcc \
+  libxml-writer-perl \
+  perl
 
 pkg_cloud_url="https://packagecloud.io/install/repositories/citusdata/the-process/script.deb.sh"
 
