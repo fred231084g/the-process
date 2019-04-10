@@ -1,11 +1,13 @@
-#!/usr/bin/env perl -w
+#!/usr/bin/env perl
 
 use strict;
+use warnings;
 
-use feature "switch";
+use feature 'switch';
 no warnings 'experimental::smartmatch';
 
 use File::Basename;
+use File::Glob ':bsd_glob';
 use Sys::Hostname;
 use XML::Writer;
 
@@ -56,21 +58,32 @@ sub parse_results_patch {
 
         foreach my $diff_line (@lines) {
             if ( $diff_line =~ /^\@\@ -(\d+),(\d+) \+(\d+),(\d+) \@\@$/ ) {
+                $detail .= "$exp_msg$act_msg$diff_msg";
+
+                if ( $detail ne '' ) {
+                    $detail .= "\n";
+                }
+
                 $exp_msg =
                   "expected (at $exp_file:$1-" . ( $1 + $2 - 1 ) . "):\n";
-                $act_msg =
-                  "     got (at $act_file:$3-" . ( $3 + $4 - 1 ) . "):\n";
-                $diff_msg = "    diff:\n";
+                $act_msg = "\ngot (at $act_file:$3-" . ( $3 + $4 - 1 ) . "):\n";
+                $diff_msg = "\ndiff:\n";
             }
             elsif ( $diff_line =~ /^([ \-\+])(.*)$/ ) {
-                $diff_msg .= "\t$diff_line\n";
-
-                my $orig_line = "\t$2\n";
+                my $orig_line = "            $2\n";
                 $exp_msg .= $orig_line if ( $1 eq ' ' or $1 eq '-' );
                 $act_msg .= $orig_line if ( $1 eq ' ' or $1 eq '+' );
+                if ( $1 eq '+' ) {
+                    $orig_line = "            <ins>$2</ins>\n";
+                }
+                elsif ( $1 eq '-' ) {
+                    $orig_line = "            <del>$2</del>\n";
+                }
+
+                $diff_msg .= $orig_line;
             }
             elsif ( $diff_line eq '' ) {
-                $detail .= "$exp_msg\n$act_msg\n$diff_msg\n";
+                $detail .= "$exp_msg$act_msg$diff_msg";
                 $exp_msg = $act_msg = $diff_msg = '';
             }
             else {
@@ -102,6 +115,7 @@ sub parse_suite_streams {
         errors    => 0,
         cases     => [],
         timestamp => '',
+        inputdir  => '',
         duration  => '',
         stdout    => '',
         stderr    => ''
@@ -114,6 +128,9 @@ sub parse_suite_streams {
 
         if ( $line =~ /^began (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})$/ ) {
             $suite{timestamp} = $1;
+        }
+        if ( $line =~ /^inputdir (.*)$/ ) {
+            $suite{inputdir} = $1;
         }
         elsif ( $line =~ /elapsed ([0-9.]+)/ ) {
             $suite{duration} = $1;
@@ -148,7 +165,7 @@ sub parse_suite_streams {
                 die 'unrecognized status';
             }
 
-            push( $suite{cases}, \%case );
+            push( @{ $suite{cases} }, \%case );
             $suite{tests}++;
         }
     }
@@ -214,11 +231,24 @@ sub generate_suite_report {
             my $time = $timings->{ $case->{name} };
             my %attrs = ( name => $case->{name} );
 
+            my @file_candidates =
+              glob( $suite->{inputdir}
+                  . '{input,sql,spec}/'
+                  . $case->{name}
+                  . '?{source,sql,spec}' );
+
             if ( exists $timings->{ $case->{name} } ) {
                 $attrs{time} = $timings->{ $case->{name} };
             }
 
-            # TODO: add assertions
+            if ( ( $#file_candidates + 1 ) == 1 ) {
+                $attrs{file} = $file_candidates[0];
+
+                my $test_lines = `wc -l < $file_candidates[0]`;
+                chomp($test_lines);
+                $attrs{assertions} = $test_lines unless $?;
+            }
+
             $xml_writer->startTag( 'testcase', %attrs );
 
             given ( $case->{status} ) {
@@ -288,10 +318,10 @@ if ( ( $#ARGV + 1 ) != 1 ) {
 my $test_output_dir = $ARGV[0];
 
 if ( !-e $test_output_dir ) {
-    die "specified file does not exist: $!";
+    die "$test_output_dir: $!";
 }
 elsif ( !-d $test_output_dir ) {
-    die "specified file is not a directory: $!";
+    die "$test_output_dir: $!";
 }
 
 generate_all_reports($test_output_dir);
