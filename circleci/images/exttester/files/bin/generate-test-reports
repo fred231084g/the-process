@@ -8,6 +8,7 @@ no warnings 'experimental::smartmatch';
 
 use File::Basename;
 use File::Glob ':bsd_glob';
+use File::Spec;
 use Sys::Hostname;
 use XML::Writer;
 
@@ -40,7 +41,7 @@ sub parse_results_patch {
 
     while ( my $diff = <$patch_fh> ) {
         chomp $diff;
-        my @lines    = split( /\n/, $diff, -1 );
+        my @lines    = split( /\n/, $diff );
         my $exp_line = shift @lines;
         my $act_line = shift @lines;
 
@@ -51,47 +52,62 @@ sub parse_results_patch {
         $exp_file = basename($exp_file);
         $act_file = basename($act_file);
 
-        my $detail   = '';
-        my $exp_msg  = '';
-        my $act_msg  = '';
-        my $diff_msg = '';
+        my $summary = "$exp_file differs from $act_file by ";
+        my $detail  = '';
+
+        my $exp_lnum   = 0;
+        my $insertions = 0;
+        my $act_lnum   = 0;
+        my $deletions  = 0;
 
         foreach my $diff_line (@lines) {
-            if ( $diff_line =~ /^\@\@ -(\d+),(\d+) \+(\d+),(\d+) \@\@$/ ) {
-                $detail .= "$exp_msg$act_msg$diff_msg";
-
-                if ( $detail ne '' ) {
-                    $detail .= "\n";
-                }
-
-                $exp_msg =
-                  "expected (at $exp_file:$1-" . ( $1 + $2 - 1 ) . "):\n";
-                $act_msg = "\ngot (at $act_file:$3-" . ( $3 + $4 - 1 ) . "):\n";
-                $diff_msg = "\ndiff:\n";
+            if ( $diff_line =~ /^\@\@ -(\d+),(\d+) \+(\d+),(\d+) \@\@/ ) {
+                $detail .= ( '_' x 105 ) . "\n";
+                $detail .= ( ' ' x 12 ) . "$diff_line\n";
+                $detail .= ( '-' x 105 ) . "\n";
+                $exp_lnum = $1;
+                $act_lnum = $3;
             }
             elsif ( $diff_line =~ /^([ \-\+])(.*)$/ ) {
-                my $orig_line = "            $2\n";
-                $exp_msg .= $orig_line if ( $1 eq ' ' or $1 eq '-' );
-                $act_msg .= $orig_line if ( $1 eq ' ' or $1 eq '+' );
-                if ( $1 eq '+' ) {
-                    $orig_line = "            <ins>$2</ins>\n";
-                }
-                elsif ( $1 eq '-' ) {
-                    $orig_line = "            <del>$2</del>\n";
-                }
+                my $format = ( $1 ne '+' ) ? '%1$4u ' : ( ' ' x 5 );
+                $format .= ( $1 ne '-' ) ? '%2$4u ' : ( ' ' x 5 );
+                $format .= '| %3$s  %4$s' . "\n";
 
-                $diff_msg .= $orig_line;
-            }
-            elsif ( $diff_line eq '' ) {
-                $detail .= "$exp_msg$act_msg$diff_msg";
-                $exp_msg = $act_msg = $diff_msg = '';
+                $detail .= sprintf( $format, $exp_lnum, $act_lnum, $1, $2 );
+
+                if ( $1 eq '-' ) {
+                    $exp_lnum++;
+                    $deletions++;
+                }
+                elsif ( $1 eq '+' ) {
+                    $act_lnum++;
+                    $insertions++;
+                }
+                elsif ( $1 eq ' ' ) {
+                    $exp_lnum++;
+                    $act_lnum++;
+                }
+                else { die 'unrecognized diff syntax'; }
             }
             else {
-                die 'unrecognized diff syntax';
+                die 'unrecognized patch syntax';
             }
         }
 
-        $diffs{$case_name} = $detail;
+        if ( $insertions gt 0 ) {
+            $summary .= "$insertions insertion";
+            $summary .= "s" if $insertions gt 1;
+            $summary .= "(+)";
+        }
+
+        if ( $deletions gt 0 ) {
+            $summary .= ", " if $insertions gt 0;
+            $summary .= "$deletions deletion";
+            $summary .= "s"  if $deletions gt 1;
+            $summary .= "(-)";
+        }
+
+        $diffs{$case_name} = "$summary\n\n$detail";
     }
 
     return \%diffs;
@@ -242,10 +258,11 @@ sub generate_suite_report {
             }
 
             if ( ( $#file_candidates + 1 ) == 1 ) {
-                $attrs{file} = $file_candidates[0];
+                $attrs{file} = File::Spec->abs2rel( $file_candidates[0],
+                    $ENV{PROJECT_ROOT} // '/' );
 
                 my $test_lines = `wc -l < $file_candidates[0]`;
-                chomp($test_lines);
+                $test_lines =~ s/^\s+|\s+$//g;
                 $attrs{assertions} = $test_lines unless $?;
             }
 
