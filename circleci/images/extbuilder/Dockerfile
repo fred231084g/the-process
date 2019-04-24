@@ -1,5 +1,5 @@
 # buildpack-deps:stretch
-FROM buildpack-deps@sha256:19a482aad09128bd0c448373d933aa0f108dc8eb9be2317dca3797c646ce4b57
+FROM buildpack-deps@sha256:8efabde824fe7c9cb1eaacaecc3b397706fe49b7fc08a1842b3799dcdf08f7c2
 
 COPY files /tmp
 
@@ -11,3 +11,5 @@ RUN set -ex; \
 
 USER circleci
 WORKDIR /home/circleci
+
+RUN mkdir -p /tmp/_circleci_local_workspace

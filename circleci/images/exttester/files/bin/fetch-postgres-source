@@ -1,0 +1,18 @@
+#!/bin/bash
+
+# make bash behave
+set -euxo pipefail
+IFS=$'\n\t'
+
+pkg_name="postgresql-${PG_MAJOR}"
+postgres_srcdir="/home/circleci/${pkg_name}"
+
+mkdir -p "${postgres_srcdir}"
+cd "${postgres_srcdir}"
+
+apt-get source --download-only "${pkg_name}"
+
+mkdir build
+
+tar -xjf  "${pkg_name}"*.bz2 --strip-components=1 --wildcards --anchored  "${pkg_name}*/*.[ch]"
+rm -f "${pkg_name}"*

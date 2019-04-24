@@ -1,0 +1,9 @@
+set verbose off
+set print pretty on
+set print array on
+set print elements 30
+set print frame-arguments none
+set print symbol-loading off
+set print repeats 3
+set print object on
+set filename-display absolute

@@ -14,10 +14,12 @@ cd / && tar xfv "${CIRCLE_WORKING_DIRECTORY}/install-${PG_MAJOR}.tar"
 
 status=0
 
-gosu circleci make -C "${CIRCLE_WORKING_DIRECTORY}/build-${PG_MAJOR}/src/test/regress" "${@}" || status=$?
+gosu circleci bash <<EOF
+ulimit -c unlimited
+make -C "${CIRCLE_WORKING_DIRECTORY}/build-${PG_MAJOR}/src/test/regress" "${@}" || status=$?
 
-diffs="${CIRCLE_WORKING_DIRECTORY}/build-${PG_MAJOR}/src/test/regress/regression.diffs"
-
-if test -f "${diffs}"; then cat "${diffs}"; fi
+cd "${CIRCLE_WORKING_DIRECTORY}/build-${PG_MAJOR}/src/test/regress"
+PROJECT_ROOT="${CIRCLE_WORKING_DIRECTORY}" generate-test-reports regress
 
 exit $status
+EOF

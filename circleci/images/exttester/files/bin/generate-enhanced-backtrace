@@ -1,0 +1,23 @@
+import gdb
+from gdb.FrameIterator import FrameIterator
+from gdb.FrameDecorator import FrameDecorator
+import itertools
+import collections
+
+import signal
+
+def _signal_name(signum):
+    try:
+        return signal.Signals(signum).name
+    except ValueError:
+        pass
+
+def signal_name(signum):
+    if signal.SIGRTMIN <= signum <= signal.SIGRTMAX:
+        return "SIGRTMIN+{}".format(signum - signal.SIGRTMIN)
+    x = _signal_name(signum)
+    if x is None:
+        # raise ValueError for invalid signals
+        signal.getsignal(signum)
+        x = "<signal {}>".format(signum)
+    return x

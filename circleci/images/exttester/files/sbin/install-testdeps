@@ -22,6 +22,8 @@ apt-get install -y --no-install-recommends \
   curl \
   debian-archive-keyring \
   gcc \
+  gdb \
+  libc-dbg \
   libxml-writer-perl \
   perl
 
@@ -35,8 +37,13 @@ Pin: release o=packagecloud.io/citusdata/the-process
 Pin-Priority: 700
 EOF
 
+echo "deb-src http://apt.postgresql.org/pub/repos/apt/ stretch-pgdg main ${PG_MAJOR}" >> /etc/apt/sources.list.d/pgdg.list
+
 echo "Installing tools for testing PostgreSQL extensions..." >&2
-apt-get update && apt-get install -y --no-install-recommends make postgresql-common perl libcurl3 "postgresql-server-dev-${PG_MAJOR}"
+apt-get update && apt-get install -y --no-install-recommends make postgresql-common perl libcurl3 "postgresql-server-dev-${PG_MAJOR}" "postgresql-${PG_MAJOR}-dbgsym"
+
+gosu circleci fetch-postgres-source
+
 
 # keep that image size small!
 echo "Cleaning up..." >&2
