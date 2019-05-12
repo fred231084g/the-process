@@ -7,7 +7,7 @@ COPY files /tmp
 RUN set -ex; \
 	ln -s /tmp/sbin/* /usr/local/sbin; \
 	ln -s /tmp/bin/* /usr/local/bin; \
-  ln -s /tmp/etc/* /etc/gdb/gdbinit; \
-	install-testdeps
+	install-testdeps; \
+  ln -sf /tmp/etc/* /etc/gdb/gdbinit
 
 WORKDIR /home/circleci

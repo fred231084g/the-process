@@ -1,10 +1,767 @@
-import gdb
-from gdb.FrameIterator import FrameIterator
-from gdb.FrameDecorator import FrameDecorator
-import itertools
-import collections
+from enum import Enum
+from collections import namedtuple, OrderedDict
+import sys
+from prettyprinter import cpprint, register_pretty
+from prettyprinter.doc import align
+from prettyprinter.doctypes import Annotated
+from prettyprinter.prettyprinter import (
+    annotate,
+    concat,
+    contextual,
+    flat_choice,
+    fill,
+    group,
+    identifier,
+    intersperse,
+    nest,
+    pretty_python_value,
+    Token,
+    NIL,
+    LINE,
+    SOFTLINE,
+    HARDLINE,
+    PrettyContext
+)
 
+from functools import partial
+import re
 import signal
+import subprocess
+
+import gdb
+from gdb.FrameDecorator import FrameDecorator
+from gdb.FrameIterator import FrameIterator
+from prettyprinter import cpprint, register_pretty
+
+# TODO teach this thing about argc/argv, flexible array members, tagged unions, and varargs
+
+pp_pp = sys.modules['prettyprinter.prettyprinter']
+old_dqs = pp_pp.determine_quote_strategy
+
+
+def new_dqs(s):
+    if isinstance(s, str):
+        return pp_pp.DOUBLE_QUOTE_TEXT
+    else:
+        return old_dqs(s)
+
+
+pp_pp.determine_quote_strategy = new_dqs
+
+
+class VALUE_MISSING_TYPE:
+    def __repr__(self):
+        return '<optimized out>'
+
+
+VALUE_OPTIMIZED_OUT = VALUE_MISSING_TYPE()
+GLOBAL_ENUM_TYPES = {}
+NULL_POINTER = gdb.parse_and_eval('(void *) 0')
+C_CHAR_TYPE = gdb.lookup_type('char')
+C_BOOL_NAMES = ['bool']
+C0_CTL_RANGE = range(0x00, 0x20)
+C1_CTL_RANGE = range(0x80, 0xa0)
+
+# ==========================
+# = NOTES ON OUTPUT FORMAT =
+# ==========================
+#
+# C identifiers [^\W\d]\w*
+#
+# integer literal [+-]?[1-9]\d*
+#
+# An unsuffixed floating constant has type double. If suffixed by the letter f or
+# F, it has type float. If suffixed by the letter l or L, it has type long double.
+#
+# float/double literal: [+-]?((\d\.)|(\d*\.\d+)
+#
+# char literal '[A-z]' | '\\x[0-9a-f]' | 0-256 | 0x[0-9a-f]{2}
+#
+# string literal: ("[.^\(\n)"]*")( \1)*
+#
+# array: int y[4][3] = { { 1, 3, 5 }, { 2, 4, 6 }, { 3, 5, 7 } };
+#
+# struct { int a[3], b; } w[] = { [0].a = {1}, [1].a[0] = 2 };
+
+COMMA = annotate(Token.PUNCTUATION, ',')
+DOT = annotate(Token.PUNCTUATION, '.')
+
+LBRACE = annotate(Token.PUNCTUATION, '{')
+RBRACE = annotate(Token.PUNCTUATION, '}')
+
+LPAREN = annotate(Token.PUNCTUATION, '(')
+RPAREN = annotate(Token.PUNCTUATION, ')')
+
+REFER_OP = annotate(Token.OPERATOR, '&')
+ASSIGN_OP = annotate(Token.OPERATOR, '=')
+
+
+class SimpleArray(namedtuple('SimpleArray', ('elements', 'specifiers', 'code'))):
+    def total_and_max_elem_width(self):
+        if self.code == gdb.TYPE_CODE_CHAR:
+            char_size = C_CHAR_TYPE.sizeof
+            char_format = '0x{{:0{:d}x}}'.format(char_size * 2)
+            max_width = len(char_format.format(0))
+
+            total_width = len(self.elements) * max_width
+            return (total_width, max_width)
+        elif self.code in (gdb.TYPE_CODE_BOOL, gdb.TYPE_CODE_INT, gdb.TYPE_CODE_FLT):
+            max_width = 0
+            total_width = 0
+            for elem in self.elements:
+                width = len(repr(elem))
+                max_width = max(width, max_width)
+                total_width += width
+            return (total_width, max_width)
+        elif self.code == gdb.TYPE_CODE_PTR:
+            max_width = 0
+            total_width = 0
+            for elem in self.elements:
+                width = 2 * elem.sizeof + 2
+                max_width = max(width, max_width)
+                total_width += width
+            return (total_width, max_width)
+        else:
+            return (0, 0)
+
+
+class SimpleAddress(namedtuple('SimpleAddress', ('value', 'sizeof', 'identifier'))):
+    pass
+
+
+class SimpleObject(namedtuple('SimpleObject', ('name', 'value', 'specifiers', 'cast', 'code'))):
+    pass
+
+
+class SimpleMemberVal(namedtuple('SimpleMemberVal', ('value', 'specifiers', 'cast', 'code'))):
+    pass
+
+
+class SimpleCompoundLiteral(namedtuple('SimpleCompoundLiteral', ('value', 'specifiers'))):
+    pass
+
+
+class SimpleStruct(OrderedDict):
+    def __init__(self, *args, **kwargs):
+        super(SimpleStruct, self).__init__(*args, **kwargs)
+
+
+def bracket(ctx, left, child, right, nesting=False):
+    spacer_pre = LINE if child != NIL else NIL
+    spacer_post = LINE if nesting else ' '
+
+    return concat([
+        left,
+        nest(ctx.indent, concat([spacer_pre, child])),
+        spacer_post,
+        right
+    ])
+
+
+def unqualified_type_ancestors(gdb_type):
+    while True:
+        gdb_type = gdb_type.unqualified()
+        yield gdb_type
+
+        if gdb_type.code != gdb.TYPE_CODE_TYPEDEF:
+            break
+
+        gdb_type = gdb_type.target()
+
+
+# TODO: do these _reliably_ override default pretty printers?
+@register_pretty('enum.Enum')
+def pretty_enum(enum, ctx, *args, **kwargs):
+    return identifier(enum.name)
+
+
+@register_pretty(bool)
+def pretty_bool(value, ctx):
+    return identifier('true' if value else 'false')
+
+
+def ensure_annotated_width(doc, width):
+    assert isinstance(doc, Annotated)
+    val = doc.doc
+
+    assert isinstance(val, str)
+    doc.doc = val.rjust(width)
+
+
+@register_pretty(bytes)
+def pretty_byte(value, ctx):
+    assert(len(value) == 1)
+
+    char_size = C_CHAR_TYPE.sizeof
+    char_format = '0x{{:0{:d}x}}'.format(char_size * 2)
+    byte_str = char_format.format(value[0])
+
+    return annotate(Token.NUMBER_BINARY, byte_str)
+
+
+@register_pretty(SimpleArray)
+def pretty_simple_array(array, ctx, *args, **kwargs):
+
+    def simple_array_evaluator(indent, column, page_width, ribbon_width):
+        columns_left_in_line = page_width - column
+        columns_left_in_ribbon = indent + ribbon_width - column
+
+        # deduct one for possibly trailing comma
+        available_width = min(columns_left_in_line, columns_left_in_ribbon) - 1
+
+        elems = array.elements
+        total_width, max_elem_width = array.total_and_max_elem_width()
+
+        # we add comma+space between each element
+        total_width += 2 * (min(len(elems), 1) - 1)
+
+        # braces + space (if totally empty, only one space)
+        total_width += 4 if elems else 3
+
+        single_line_possible = total_width <= available_width
+        wrap_beneficial = (2 + (2 * max_elem_width) + 2 + 2) <= available_width
+
+        if single_line_possible or (not wrap_beneficial):
+            return pretty_simple_array_fallback(array, ctx, *args, **kwargs)
+
+        sep_doc = concat([COMMA, LINE])
+        width_for_elems = available_width - 3  # braces + space
+        elems_per_line = width_for_elems // (max_elem_width + 2)
+
+        sep_doc = concat([COMMA, ' '])
+        block_docs = []
+
+        for i in range(0, len(elems), elems_per_line):
+            line_elems = elems[i:i+elems_per_line]
+
+            if block_docs:
+                block_docs[-1].append(COMMA)
+                block_docs[-1].append(HARDLINE)
+
+            line_docs = [pretty_python_value(e, ctx) for e in line_elems]
+
+            for doc in line_docs:
+                ensure_annotated_width(doc, max_elem_width)
+
+            line_docs = intersperse(sep_doc, line_docs)
+            block_docs.append(list(line_docs))
+
+        block_docs = [group(concat(ldocs)) for ldocs in block_docs]
+
+        block_doc = align(concat(block_docs))
+        block_doc = concat([LBRACE, ' ', block_doc, ' ', RBRACE])
+
+        return block_doc
+
+    return contextual(simple_array_evaluator)
+
+
+def pretty_simple_array_fallback(array, ctx, *args, **kwargs):
+    elems = array.elements
+
+    elems_doc = NIL
+    nesting = False
+
+    if elems:
+        elem_docs = [pretty_python_value(elem, ctx) for elem in elems]
+
+        sep_doc = concat([COMMA, LINE])
+        elem_docs = intersperse(sep_doc, elem_docs)
+
+        elems_doc = concat(elem_docs)
+        nesting = needs_braces(elems[-1])
+
+    array_doc = bracket(ctx, LBRACE, elems_doc, RBRACE, nesting=nesting)
+    array_doc = group(array_doc)
+
+    return array_doc
+
+
+@register_pretty(SimpleStruct)
+def pretty_simple_struct(struct, ctx, *args, **kwargs):
+    elems_doc = NIL
+    nesting = False
+
+    elem_docs = []
+    final_val = None
+    for name, value in struct.items():
+        lhs_doc = concat([DOT, identifier(name)])
+        rhs_val = value.value
+        rhs_doc = pretty_python_value(rhs_val, ctx)
+
+        elem_doc = pretty_assign_expr(lhs_doc, rhs_doc, ctx, type(rhs_val))
+        elem_docs.append(elem_doc)
+
+        final_val = rhs_val
+
+    if elem_docs:
+        sep_doc = concat([COMMA, LINE])
+        elem_docs = intersperse(sep_doc, elem_docs)
+
+        elems_doc = concat(elem_docs)
+        nesting = needs_braces(final_val)
+
+    struct_doc = bracket(ctx, LBRACE, elems_doc, RBRACE, nesting=nesting)
+    struct_doc = group(struct_doc)
+
+    return struct_doc
+
+
+@register_pretty(SimpleAddress)
+def pretty_simple_address(addr, ctx, *args, **kwargs):
+    if addr.identifier:
+        return identifier(addr.identifier)
+    elif addr.value:
+        hex_addr = ('0x{{:0{}x}}').format(addr.sizeof * 2).format(addr.value)
+        return annotate(Token.NUMBER_INT, hex_addr)
+    else:
+        return annotate(Token.NAME_BUILTIN, 'NULL')
+
+
+@register_pretty(SimpleObject)
+def pretty_simple_object(obj, ctx, *args, **kwargs):
+    lhs_doc = concat([identifier(obj.specifiers), ' ', identifier(obj.name)])
+    rhs_val = obj.value
+    rhs_doc = pretty_python_value(rhs_val, ctx)
+
+    return pretty_assign_expr(lhs_doc, rhs_doc, ctx, type(rhs_val))
+
+
+def pretty_assign_expr(lhs_doc, rhs_doc, ctx, rhs_type):
+    if rhs_type in (SimpleArray, SimpleStruct, SimpleCompoundLiteral):
+        rhs_doc = concat([' ', rhs_doc])
+    else:
+        rhs_doc = nest(ctx.indent, concat([LINE, rhs_doc]))
+
+    return group(concat([lhs_doc, ' ', ASSIGN_OP, rhs_doc]))
+
+
+@register_pretty(SimpleCompoundLiteral)
+def pretty_compound_literal(obj, ctx, *args, **kwargs):
+    specs = obj.specifiers
+    complit_docs = [
+        group(concat([REFER_OP, LPAREN, identifier(specs), RPAREN]))]
+    spacer = ' '
+
+    val = obj.value
+    val_doc = pretty_python_value(val, ctx)
+
+    if not needs_braces(val):
+        spacer = SOFTLINE
+        val_doc = bracket(ctx, LBRACE, val_doc, RBRACE)
+
+    complit_docs.append(spacer)
+    complit_docs.append(val_doc)
+
+    lit_doc = concat(complit_docs)
+    return group(lit_doc)
+
+
+def needs_braces(obj):
+    otype = obj if obj is type else type(obj)
+    return otype in (SimpleArray, SimpleStruct, SimpleCompoundLiteral)
+
+
+@register_pretty(SimpleMemberVal)
+def pretty_simple_member_val(mem, ctx, *args, **kwargs):
+    docs = []
+    docs.append(pretty_python_value(mem.value, ctx))
+
+    obj_doc = concat(docs)
+
+    return obj_doc
+
+
+class DepthManager:
+    def __init__(self, max_depth=0):
+        self._max_depth = max_depth
+        self._current_depth = 0
+
+    def can_descend(self):
+        return self._current_depth <= self._max_depth
+
+    def __enter__(self):
+        self._current_depth += 1
+        return self
+
+    def __exit__(self, *exc):
+        self._current_depth -= 1
+        return False
+
+
+DEPTH_MANAGER = DepthManager(max_depth=2)
+
+
+def to_python_obj(name, gdb_type, gdb_val):
+    base_type = gdb.types.get_basic_type(gdb_type)
+
+    py_val = to_python_val(gdb_val)
+
+    return SimpleObject(name=name, specifiers=str(gdb_type),
+                        value=py_val, cast=None, code=base_type.code)
+
+
+def to_python_member_val(gdb_val):
+    gdb_type = gdb_val.type
+    base_type = gdb.types.get_basic_type(gdb_type)
+
+    py_val = to_python_val(gdb_val)
+
+    return SimpleMemberVal(value=py_val, specifiers=str(gdb_type), cast=None, code=base_type.code)
+
+
+def to_python_val(gdb_val):
+    if gdb_val.is_optimized_out:
+        return VALUE_OPTIMIZED_OUT
+
+    gdb_type = gdb_val.type
+    base_type = gdb.types.get_basic_type(gdb_type)
+
+    if is_bool_type(gdb_type):
+        gdb_code = gdb.TYPE_CODE_BOOL
+    elif base_type == C_CHAR_TYPE:
+        gdb_code = gdb.TYPE_CODE_CHAR
+    else:
+        gdb_code = base_type.code
+
+    mapper = TYPE_CODE_CONVERSION_MAPPING.get(gdb_code) or to_unimpl_str
+
+    return mapper(gdb_val, base_type)
+
+# detect TYPE_CODE_BOOL-like cases
+
+
+def is_bool_type(gdb_type):
+    lineage = unqualified_type_ancestors(gdb_type)
+
+    ancestor_bool_gen = ((gdb_type.name in C_BOOL_NAMES)
+                         for gdb_type in lineage)
+
+    return any(ancestor_bool_gen)
+
+# handle TYPE_CODE_PTR (1)
+
+
+def to_python_ptr(gdb_ptr, base_type):
+    # if it seems like a string, try to print it as one
+    py_str = maybe_convert_to_str(gdb_ptr, base_type)
+    if py_str is not None:
+        return py_str
+
+    # if we have room to, descend into the pointer's value
+    with DEPTH_MANAGER:
+        if DEPTH_MANAGER.can_descend():
+            try:
+                orig_type = gdb_ptr.type
+                gdb_val = gdb_ptr.dereference()
+
+                py_val = to_python_val(gdb_val)
+
+                if isinstance(py_val, SimpleAddress) and py_val.identifier:
+                    # this was a function pointer; don't wrap in type
+                    return py_val
+                else:
+                    return SimpleCompoundLiteral(value=py_val,
+                                                 specifiers=str(orig_type))
+            except gdb.error:
+                pass
+
+    # fall back to just showing the address in the pointer, though
+    # we still need to ensure it's been converted to unsigned
+    # convert to unsigned, first
+    py_unsigned = to_unsigned(gdb_ptr, base_type.sizeof)
+    return SimpleAddress(value=py_unsigned, sizeof=base_type.sizeof, identifier=None)
+
+# handle TYPE_CODE_ARRAY (2)
+
+
+def to_python_array(gdb_array, base_type):
+    # range is a tuple of min and max valid indexes
+    array_len = base_type.range()[1] + 1
+
+    # if it seems like a string, try to print it as one
+    py_str = maybe_convert_to_str(gdb_array, base_type, array_len)
+    if py_str is not None:
+        return py_str
+
+    elem_type = base_type.target()
+    base_elem_type = gdb.types.get_basic_type(elem_type)
+
+    if is_bool_type(elem_type):
+        gdb_code = gdb.TYPE_CODE_BOOL
+    elif base_elem_type == C_CHAR_TYPE:
+        gdb_code = gdb.TYPE_CODE_CHAR
+    else:
+        gdb_code = base_elem_type.code
+
+    py_elems = [to_python_val(gdb_array[idx]) for idx in range(array_len)]
+
+    return SimpleArray(elements=py_elems, specifiers=str(base_elem_type), code=gdb_code)
+
+# handle TYPE_CODE_STRUCT (3)
+
+
+def to_python_struct(gdb_struct, base_type):
+    py_struct = SimpleStruct()
+    for name in base_type:
+        py_struct[name] = to_python_member_val(gdb_struct[name])
+
+    return py_struct
+
+# handle TYPE_CODE_ENUM (5)
+
+
+def to_python_enum(gdb_enum, base_type):
+    enum_name = base_type.tag or '(Enumeration Constant)'
+    enum_vals = frozenset((f.name, f.enumval) for f in base_type.itervalues())
+    type_key = (enum_name, enum_vals)
+
+    enum_class = GLOBAL_ENUM_TYPES.get(type_key)
+    if enum_class is None:
+        enum_class = Enum(*type_key)
+        GLOBAL_ENUM_TYPES[type_key] = enum_class
+
+    py_val = int(gdb_enum)
+
+    try:
+        py_val = enum_class(py_val)
+    except ValueError:
+        pass
+
+    return py_val
+
+# handle TYPE_CODE_FUNC (7)
+
+
+def to_python_func(gdb_func, base_type):
+    gdb_addr = gdb_func.address
+    py_unsigned = to_unsigned(gdb_addr, base_type.sizeof)
+
+    try:
+        func_block = gdb.block_for_pc(int(gdb_addr))
+    except RuntimeError:
+        func_block = None
+
+    if func_block and func_block.function:
+        identifier = func_block.function.name
+    else:  # could reach here if memory is garbage
+        identifier = None
+
+    return SimpleAddress(value=py_unsigned, sizeof=base_type.sizeof, identifier=identifier)
+
+
+def to_single_byte(gdb_char, base_type):
+    char_size = C_CHAR_TYPE.sizeof
+    int_val = to_unsigned(gdb_char, char_size)
+
+    return bytes([int_val])
+
+# handle TYPE_CODE_CHAR (19)
+
+
+def to_char_desc(gdb_char):
+    char_size = gdb_char.type.sizeof
+    int_val = to_unsigned(gdb_char, char_size)
+    disp_int = int_val
+    disp_prefix = "'"
+
+    if int_val in C0_CTL_RANGE:
+        disp_int += 0x2400
+    elif int_val in C1_CTL_RANGE:
+        disp_int -= 64
+        disp_prefix += 'ESC '
+
+    char_format = '0x{{:0{:d}x}} ({{:{:d}d}}) {}{{:c}}\''.format(
+        char_size * 2, 3, disp_prefix)
+    char_desc = char_format.format(int_val, int_val, disp_int)
+
+    return char_desc
+
+
+def to_unimpl_str(gdb_val, base_type):
+    return '!!UNIMPL!!    type: {}, code: {}, val: {}'.format(str(base_type),
+                                                              base_type.code,
+                                                              str(gdb_val))
+
+
+def to_unsigned(value, size=8):
+    # values from GDB can be used transparently but are not suitable for
+    # being printed as unsigned integers, so a conversion is needed
+    mask = (2 ** (size * 8)) - 1
+    return int(value.cast(gdb.Value(mask).type)) & mask
+
+
+def maybe_convert_to_str(gdb_val, base_type, expected_bytes=None):
+    elem_type = base_type.target()
+    if is_bool_type(elem_type):
+        return None
+
+    elem_type = gdb.types.get_basic_type(elem_type)
+    if elem_type != C_CHAR_TYPE:
+        return None
+
+    try:
+        py_str = gdb_val.string(length=-1)
+    except UnicodeError:
+        # failed to convert; return None
+        return None
+    except gdb.MemoryError:
+        return None
+
+    # verify the string returned by gdb actually used all the bytes present in
+    # our input. If not, tell the caller to display in a different format
+    if expected_bytes:
+        # re-encode to count bytes
+        byte_length = len(py_str.encode(gdb.target_charset()))
+
+        # expected_bytes will include a final NUL if coming from a a "C string";
+        # Python doesn't use those, so subtract one when comparing byte lengths:
+        if byte_length != (expected_bytes - 1):
+            return None
+
+    return py_str
+
+
+TYPE_CODE_CONVERSION_MAPPING = {
+    gdb.TYPE_CODE_PTR: to_python_ptr,
+    gdb.TYPE_CODE_ARRAY: to_python_array,
+    gdb.TYPE_CODE_STRUCT: to_python_struct,
+    gdb.TYPE_CODE_UNION: to_python_struct,
+    gdb.TYPE_CODE_ENUM: to_python_enum,
+    gdb.TYPE_CODE_FUNC: to_python_func,
+    gdb.TYPE_CODE_INT: lambda v, t: int(v),
+    gdb.TYPE_CODE_FLT: lambda v, t: float(v),
+    gdb.TYPE_CODE_CHAR: to_single_byte,
+    gdb.TYPE_CODE_BOOL: lambda v, t: bool(v)
+}
+
+
+def collect_typedef_codes(type_map, gdb_type):
+    while gdb_type.code == gdb.TYPE_CODE_TYPEDEF:
+        type_map[gdb_type.code].add(str(gdb_type))
+        gdb_type = gdb_type.target()
+
+    type_map[gdb_type.code].add(str(gdb_type))
+
+    return gdb_type
+
+
+def collect_types(type_map, gdb_var):
+    basic_type = collect_typedef_codes(type_map, gdb_var.type)
+
+    if basic_type.code == gdb.TYPE_CODE_ARRAY:
+        elem_type = basic_type.target()
+        # range is a tuple of min and max valid indexes
+        array_len = basic_type.range()[1] + 1
+
+        elem_type = collect_typedef_codes(type_map, elem_type)
+        if gdb.types.get_basic_type(elem_type) == C_CHAR_TYPE:
+            type_map[gdb.TYPE_CODE_STRING].add(str(elem_type))
+        else:
+            elem_gen = (gdb_var[idx] for idx in range(array_len))
+            for elem in elem_gen:
+                collect_types(type_map, elem)
+    elif basic_type.code in [gdb.TYPE_CODE_STRUCT, gdb.TYPE_CODE_UNION]:
+        elem_gen = (gdb_var[key] for key in basic_type.iterkeys())
+        for elem in elem_gen:
+            collect_types(type_map, elem)
+    elif basic_type.code == gdb.TYPE_CODE_PTR:
+        with DEPTH_MANAGER:
+            if DEPTH_MANAGER.can_descend():
+                try:
+                    collect_types(type_map, gdb_var.dereference())
+                except gdb.MemoryError:
+                    pass
+                except gdb.error:
+                    pass
+
+
+def format_address(address):
+    pointer_size = gdb.parse_and_eval('$pc').type.sizeof
+    return ('0x{{:0{}x}}').format(pointer_size * 2).format(address)
+
+
+def find_best_sal(frame):
+    fpc = frame.pc()
+
+    def lte_fpc(sal):
+        return (sal.last or sal.pc) <= fpc
+
+    def dist_to_pc(sal):
+        return fpc - (sal.last or sal.pc)
+
+    fsal = frame.find_sal()
+    if fsal.pc == 0 and fsal.last is None:
+        unparsed, sals = gdb.decode_line(
+            fsal.symtab.filename + ':{}'.format(fsal.line))
+        valid_sals = filter(lte_fpc, sals)
+
+        fsal = min(valid_sals, key=dist_to_pc)
+
+    return fsal
+
+
+def calculate_line_range(sal, limit):
+    ltab = sal.symtab.linetable()
+    maxlnum = max(ltab.source_lines())
+
+    def gte(pc, le):
+        return le.pc >= pc and le.pc < limit
+
+    def dist_from(pc, le):
+        return le.pc - pc
+
+    prev_pc = sal.pc
+    high_lnum = sal.line
+    high_mline = None
+
+    for lnum in range(sal.line, maxlnum):
+        lentries = ltab.line(lnum)
+
+        if lentries is None:
+            high_lnum = lnum
+
+            if high_mline is None:
+                break
+            else:
+                continue
+        else:
+            gte_pc = partial(gte, prev_pc)
+            candidate_lentries = filter(gte_pc, lentries)
+
+            dist_from_pc = partial(dist_from, prev_pc)
+            best_le = min(candidate_lentries, key=dist_from_pc, default=None)
+
+            if best_le:
+                prev_pc = best_le.pc
+                high_lnum = high_mline = best_le.line
+            else:
+                break
+
+    return sal.line, high_lnum, high_mline
+
+
+def print_src_lines(filename, srcstart, srcend, lstart, high_mline):
+    result = subprocess.run(['sed', '-n', '{},{}p;{}q'.format(srcstart, srcend, srcend+1),
+                             filename], stdout=subprocess.PIPE, check=True, universal_newlines=True)
+
+    src_lines = result.stdout
+    src_lines = src_lines.rstrip().split('\n')
+    high_mline = high_mline or lstart
+
+    for num, line in enumerate(src_lines, start=srcstart):
+        line = line.replace('\t', '    ')
+        prefix = '    '
+
+        if lstart <= num <= high_mline:
+            prefix = '--> '
+        elif num > high_mline and re.match(r'\s*(}|/\*|#ifdef)', line):
+            break
+
+        print('{} {:4d} | {}'.format(prefix, num, line))
+
+    print(' ' * 12 + '.' * 93)
+
 
 def _signal_name(signum):
     try:
@@ -12,12 +769,74 @@ def _signal_name(signum):
     except ValueError:
         pass
 
+
 def signal_name(signum):
     if signal.SIGRTMIN <= signum <= signal.SIGRTMAX:
-        return "SIGRTMIN+{}".format(signum - signal.SIGRTMIN)
+        return 'SIGRTMIN+{}'.format(signum - signal.SIGRTMIN)
     x = _signal_name(signum)
     if x is None:
         # raise ValueError for invalid signals
         signal.getsignal(signum)
-        x = "<signal {}>".format(signum)
+        x = '<signal {}>'.format(signum)
     return x
+
+
+def print_header():
+    # 'The current OS ABI is "auto" (currently "GNU/Linux").\nThe default OS ABI is "GNU/Linux".\n'
+    # match The current OS ABI is "([^"]+)"
+    # If that is _auto_, then match (currently "([^"]+)")
+
+    abi_description = gdb.execute('show osabi', to_string=True)
+    print('==== OSABI ====')
+    print('{}\n\n\n'.format(abi_description))
+
+    raw_siginfo = gdb.parse_and_eval('$_siginfo')
+    gdb_type = raw_siginfo.type
+    py_val = to_python_obj('siginfo', gdb_type, raw_siginfo)
+
+    print('==== SIGINFO ====')
+
+    cpprint(py_val, indent=2, width=80, ribbon_width=80)
+
+
+def print_frame(frame):
+    print('\n\n\n')
+    print('==== FRAME {} ===='.format(str(frame)))
+
+    sal = find_best_sal(frame)
+    limit = min(frame.block().end, frame.pc())
+
+    lstart, srcend, high_mline = calculate_line_range(sal, limit)
+    srcstart = max(lstart - 10, 1)
+
+    print_src_lines(sal.symtab.filename, srcstart,
+                    srcend, lstart, high_mline)
+    print('\n\n')
+    print('==== LOCALS ====')
+    decorator = FrameDecorator(frame)
+    for gdb_symval in decorator.frame_locals():
+        gdb_sym = gdb_symval.sym
+        gdb_val = gdb_sym.value(frame)
+
+        py_obj = to_python_obj(gdb_sym.name, gdb_sym.type, gdb_val)
+
+        cpprint(py_obj, indent=2, width=80, ribbon_width=80)
+
+    print('\n\n')
+    print('==== ARGUMENTS ====')
+    for gdb_symval in decorator.frame_args():
+        gdb_sym = gdb_symval.sym
+        gdb_val = gdb_sym.value(frame)
+
+        py_obj = to_python_obj(gdb_sym.name, gdb_sym.type, gdb_val)
+
+        cpprint(py_obj, indent=2, width=80, ribbon_width=80)
+
+
+if __name__ == '__main__':
+    print_header()
+
+    for __frame in reversed([*FrameIterator(gdb.newest_frame())]):
+        __frame.select()
+
+        print_frame(__frame)
