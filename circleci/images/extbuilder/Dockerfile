@@ -3,6 +3,8 @@ FROM buildpack-deps@sha256:19a482aad09128bd0c448373d933aa0f108dc8eb9be2317dca379
 
 COPY files /tmp
 
+ARG PG_MAJOR
+
 RUN set -ex; \
 	ln -s /tmp/sbin/* /usr/local/sbin/; \
 	ln -s /tmp/bin/* /usr/local/bin/; \
