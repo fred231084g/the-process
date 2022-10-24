@@ -3,13 +3,18 @@ FROM buildpack-deps:bullseye
 # add unpriviliged user for tests
 RUN useradd -ms /bin/bash circleci
 
-RUN apt-get update \
+RUN wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key | APT_KEY_DONT_WARN_ON_DANGEROUS_USAGE=1 apt-key add -
+
+RUN echo "deb http://apt.llvm.org/bullseye/ llvm-toolchain-bullseye-14 main" >> /etc/apt/sources.list.d/postgresql.list \
+ && echo "deb-src http://apt.llvm.org/bullseye/ llvm-toolchain-bullseye-14 main" >> /etc/apt/sources.list.d/postgresql.list \
+ && apt-get update \
 # install dependencies
  && apt-get install -y --no-install-recommends \
     apt-transport-https \
     autoconf \
     build-essential \
     ca-certificates \
+    clang-14 \
     curl \
     debian-archive-keyring \
     gcc \
